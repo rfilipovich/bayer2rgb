@@ -18,6 +18,7 @@
  * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  **/
+#define DEBUG 1
 
 #include <fcntl.h>
 #include <getopt.h>
@@ -147,6 +148,7 @@ usage( char * name )
 	printf("   --method,-m    interpolation method: NEAREST, SIMPLE, BILINEAR, HQLINEAR, DOWNSAMPLE, EDGESENSE, VNG, AHD\n");
 	printf("   --tiff,-t      add a tiff header\n");
 	printf("   --swap,-s      if bpp == 16, swap byte order before conversion\n");
+	printf("   --10bit,-k     use a 10 bpp input packed to 16 bit per pixel file and convert the data to 8 bpp and after that apply debayer as 8bpp\n");
 	printf("   --help,-h      this helpful message\n");
 }
 
@@ -165,6 +167,7 @@ main( int argc, char ** argv )
     int c;
     int optidx = 0;
     int swap = 0;
+    int _10bit = 0;
 
     struct option longopt[] = {
         {"input",1,NULL,'i'},
@@ -177,10 +180,11 @@ main( int argc, char ** argv )
         {"method",1,NULL,'m'},
         {"tiff",0,NULL,'t'},
         {"swap",0,NULL,'s'},
+        {"10bit",0,NULL,'k'},
         {0,0,0,0}
     };
 
-    while ((c=getopt_long(argc,argv,"i:o:w:v:b:f:m:ths",longopt,&optidx)) != -1)
+    while ((c=getopt_long(argc,argv,"i:o:w:v:b:f:m:thsk",longopt,&optidx)) != -1)
     {
         switch ( (char)c )
         {
@@ -210,6 +214,9 @@ main( int argc, char ** argv )
 				break;
 			case 't':
 				tiff = TIFF_HDR_SIZE;
+				break;
+			case 'k':
+				_10bit = 1;
 				break;
 			case 'h':
 				usage(argv[0]);
@@ -246,7 +253,7 @@ main( int argc, char ** argv )
     in_size = lseek(input_fd, 0, SEEK_END );
     lseek(input_fd, 0, 0);
 
-    out_size = width * height * (bpp / 8) * 3 + tiff;
+    out_size = width * height * ((_10bit!=0 ? 8 : bpp) / 8) * 3 + tiff;
 
     ftruncate(output_fd, out_size );
 
@@ -265,14 +272,14 @@ main( int argc, char ** argv )
 #ifdef DEBUG
     printf("%p -> %p\n", bayer, rgb);
 
-    printf("%s: %s(%d) %s(%d) %d %d %d, %d %d\n", argv[0], infile, in_size, outfile, out_size, width, height, bpp, first_color, method );
+    printf("%s: %s(%d) %s(%d) %d %d %d, %d %d\n", argv[0], infile, in_size, outfile, out_size, width, height,  _10bit!=0 ? 8 : bpp, first_color, method );
 
     //memset(rgb, 0xff, out_size);//return 1;
 #endif
 
 	if(tiff)
 	{
-		rgb_start = put_tiff(rgb, width, height, bpp);
+		rgb_start = put_tiff(rgb, width, height, _10bit!=0 ? 8 : bpp);
 	}
 #if 1
 	switch(bpp)
@@ -282,26 +289,48 @@ main( int argc, char ** argv )
 			break;
 		case 16:
 		default:
-            if(swap){
-                uint8_t tmp=0;
-                uint32_t i=0;
-                for(i=0;i<in_size;i+=2){
-                    tmp = *(((uint8_t*)bayer)+i);
-                    *(((uint8_t*)bayer)+i) = *(((uint8_t*)bayer)+i+1);
-                    *(((uint8_t*)bayer)+i+1) = tmp;
-                }
-            }
-			dc1394_bayer_decoding_16bit((const uint16_t*)bayer, (uint16_t*)rgb_start, width, height, first_color, method, bpp);
+			if(_10bit) {
+				uint8_t *p_conv = malloc(width * height * sizeof(uint8_t));
+				uint8_t *const pInB = p_conv;
+				uint8_t *const p_conv_end = p_conv + width * height;
+				const uint16_t *pIn = (const uint16_t *)bayer;
+
+				while(p_conv < p_conv_end) {
+					if(swap) { /* swap bytes in short if need */
+						uint8_t tmp = *(((uint8_t*)pIn)); /* swap */
+						*(((uint8_t*)pIn)) = *(((uint8_t*)pIn)+1);
+						*(((uint8_t*)pIn)+1) = tmp;
+					};
+
+					*p_conv = (*pIn >> 2);
+					p_conv++; pIn++;
+				};
+
+				dc1394_bayer_decoding_8bit(pInB, (uint8_t*)rgb_start, width, height, first_color, method);
+				if(pInB) free(pInB);
+			} else {
+				if(swap){
+					uint8_t tmp=0;
+					uint32_t i=0;
+					for(i=0;i<in_size;i+=2){
+						tmp = *(((uint8_t*)bayer)+i);
+						*(((uint8_t*)bayer)+i) = *(((uint8_t*)bayer)+i+1);
+						*(((uint8_t*)bayer)+i+1) = tmp;
+					}
+				}
+
+				dc1394_bayer_decoding_16bit((const uint16_t*)bayer, (uint16_t*)rgb_start, width, height, first_color, method, bpp);
+			};
 			break;
 	}
 #endif
 
 #if DEBUG
 	printf("Last few In: %x %x %x %x\n", 
-			((uint32_t*)bayer)[0],
-			((uint32_t*)bayer)[1],
-			((uint32_t*)bayer)[2],
-			((uint32_t*)bayer)[3]);
+			((uint16_t*)bayer)[0],
+			((uint16_t*)bayer)[1],
+			((uint16_t*)bayer)[2],
+			((uint16_t*)bayer)[3]);
 
 //			((int*)rgb)[2] = 0xadadadad;
 	printf("Last few Out: %x %x %x %x\n", 
